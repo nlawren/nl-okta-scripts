@@ -1,0 +1,6 @@
+# Never commit the real token
+.env
+.venv/
+__pycache__/
+.ruff_cache/
+output.csv

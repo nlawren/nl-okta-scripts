@@ -1,0 +1,55 @@
+# Steps shared by the dry-run and apply jobs in okta-deprovision.yml.
+# Everything runs inside okta-deprovision/, which is self-contained.
+parameters:
+  - name: apply
+    type: boolean
+    default: false
+
+steps:
+  - bash: |
+      if [ "$(Build.Reason)" != "Manual" ]; then
+        echo "##vso[task.logissue type=error]okta-deprovision only runs when started manually (reason: $(Build.Reason))."
+        exit 1
+      fi
+      echo "Manual run by $(Build.RequestedFor) on $(Build.SourceBranch) at $(Build.SourceVersion)"
+    displayName: Guard - manual runs only
+
+  - checkout: self   # deployment jobs don't check out by default, so do it here for both
+    fetchDepth: 1
+
+  - task: Cache@2
+    displayName: Cache uv packages
+    inputs:
+      key: 'uv | "$(Agent.OS)" | okta-deprovision/uv.lock'
+      path: $(Pipeline.Workspace)/.uv-cache
+
+  - bash: |
+      set -euo pipefail
+      curl -LsSf "https://astral.sh/uv/0.12.18/install.sh" | sh
+      echo "##vso[task.prependpath]$HOME/.local/bin"
+    displayName: Install uv
+
+  - bash: uv sync --locked --no-dev
+    displayName: Install Python and dependencies
+    workingDirectory: $(Build.SourcesDirectory)/okta-deprovision
+    env:
+      UV_CACHE_DIR: $(Pipeline.Workspace)/.uv-cache
+
+  - bash: uv run --no-sync deactivate_users.py --input users.csv --output output.csv ${{ iif(parameters.apply, '--apply', '') }}
+    displayName: ${{ iif(parameters.apply, 'Deactivate Okta users', 'Dry run - report only') }}
+    workingDirectory: $(Build.SourcesDirectory)/okta-deprovision
+    env:
+      OKTA_ORG_URL: $(OKTA_ORG_URL)
+      OKTA_API_TOKEN: $(OKTA_API_TOKEN)   # secrets only reach a step when mapped here
+      PYTHONUNBUFFERED: "1"
+
+  - bash: uv cache prune --ci
+    displayName: Trim uv cache
+    condition: always()
+    env:
+      UV_CACHE_DIR: $(Pipeline.Workspace)/.uv-cache
+
+  - publish: $(Build.SourcesDirectory)/okta-deprovision/output.csv
+    artifact: okta-deprovision-${{ iif(parameters.apply, 'applied', 'dry-run') }}-report-$(System.JobAttempt)
+    displayName: Publish report
+    condition: always()

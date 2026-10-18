@@ -1,0 +1,62 @@
+# okta-deprovision: deactivate the Okta users listed in okta-deprovision/users.csv.
+#
+# MANUAL RUNS ONLY. Nothing starts this pipeline automatically: no CI trigger,
+# no PR trigger, no schedule and no pipeline-resource trigger. A guard step
+# also fails any run whose reason isn't Manual.
+#
+# DRY RUN BY DEFAULT. "Apply changes" is unticked unless you tick it.
+#   Dry run - normal job, runs straight away, changes nothing.
+#   Apply   - only from main; a deployment job on the okta-production
+#             environment, so it waits for approval before any step runs.
+
+name: okta-deprovision-$(Date:yyyyMMdd)$(Rev:.r)-${{ iif(parameters.apply, 'APPLY', 'dry-run') }}
+
+trigger: none
+pr: none
+
+parameters:
+  - name: apply
+    displayName: Apply changes (deactivate users). Leave unticked for a dry run.
+    type: boolean
+    default: false
+
+variables:
+  # Library variable group (secret padlock on the token; pipeline permissions
+  # restricted to this pipeline only):
+  #   OKTA_ORG_URL    plain, e.g. https://example.okta.com
+  #   OKTA_API_TOKEN  secret
+  - group: okta-poc
+
+pool:
+  vmImage: ubuntu-latest
+
+jobs:
+  - ${{ if eq(parameters.apply, false) }}:
+      - job: DryRun
+        displayName: Dry run (no changes)
+        steps:
+          - template: templates/okta-deprovision-steps.yml
+            parameters:
+              apply: false
+
+  - ${{ elseif eq(variables['Build.SourceBranch'], 'refs/heads/main') }}:
+      - deployment: Apply
+        displayName: Deactivate Okta users
+        environment: okta-production   # approval + branch control checks live here
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - template: templates/okta-deprovision-steps.yml
+                  parameters:
+                    apply: true
+
+  - ${{ else }}:
+      - job: Blocked
+        displayName: Apply refused (not on main)
+        steps:
+          - checkout: none
+          - bash: |
+              echo "##vso[task.logissue type=error]Apply runs are only allowed from main (this run: $(Build.SourceBranch)). Run a dry run instead, or merge first."
+              exit 1
+            displayName: Refuse apply from a non-main branch
