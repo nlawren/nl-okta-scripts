@@ -1,1 +1,3 @@
-# nl-okta-scripts
+# Okta Scripts and the like
+
+For learning and experimentating.
