@@ -4,21 +4,29 @@
 # no PR trigger, no schedule and no pipeline-resource trigger. A guard step
 # also fails any run whose reason isn't Manual.
 #
-# DRY RUN BY DEFAULT. "Apply changes" is unticked unless you tick it.
-#   Dry run - normal job, runs straight away, changes nothing.
-#   Apply   - only from main; a deployment job on the okta-production
-#             environment, so it waits for approval before any step runs.
+# DRY RUN BY DEFAULT. "Mode" is dry-run unless you pick something else.
+#   dry-run  - normal job, runs straight away, changes nothing.
+#   validate - normal job, runs straight away, changes nothing; reports each
+#              user's Okta status and last login (users-validated.csv).
+#   apply    - only from main. First runs a dry run of the same commit, then
+#              a deployment job on the okta-production environment, which waits
+#              for approval. Approvers check that run's dry-run report: it shows
+#              exactly what the apply stage will do.
 
-name: okta-deprovision-$(Date:yyyyMMdd)$(Rev:.r)-${{ iif(parameters.apply, 'APPLY', 'dry-run') }}
+name: okta-deprovision-$(Date:yyyyMMdd)$(Rev:.r)-${{ iif(eq(parameters.mode, 'apply'), 'APPLY', parameters.mode) }}
 
 trigger: none
 pr: none
 
 parameters:
-  - name: apply
-    displayName: Apply changes (deactivate users). Leave unticked for a dry run.
-    type: boolean
-    default: false
+  - name: mode
+    displayName: "Mode: dry-run (report what would change), validate (report Okta status and last login), apply (deactivate users)"
+    type: string
+    default: dry-run
+    values:
+      - dry-run
+      - validate
+      - apply
 
 variables:
   # Library variable group (secret padlock on the token; pipeline permissions
@@ -30,33 +38,56 @@ variables:
 pool:
   vmImage: ubuntu-latest
 
-jobs:
-  - ${{ if eq(parameters.apply, false) }}:
-      - job: DryRun
+stages:
+  - ${{ if eq(parameters.mode, 'validate') }}:
+      - stage: Validate
+        displayName: Validate users (no changes)
+        jobs:
+          - job: Validate
+            displayName: Validate users (no changes)
+            steps:
+              - template: templates/okta-deprovision-steps.yml
+                parameters:
+                  mode: validate
+
+  # Every dry-run and apply run starts here; apply continues to the Apply stage
+  - ${{ elseif or(eq(parameters.mode, 'dry-run'), eq(variables['Build.SourceBranch'], 'refs/heads/main')) }}:
+      - stage: DryRun
         displayName: Dry run (no changes)
-        steps:
-          - template: templates/okta-deprovision-steps.yml
-            parameters:
-              apply: false
+        jobs:
+          - job: DryRun
+            displayName: Dry run (no changes)
+            steps:
+              - template: templates/okta-deprovision-steps.yml
+                parameters:
+                  mode: dry-run
 
-  - ${{ elseif eq(variables['Build.SourceBranch'], 'refs/heads/main') }}:
-      - deployment: Apply
-        displayName: Deactivate Okta users
-        environment: okta-production   # approval + branch control checks live here
-        strategy:
-          runOnce:
-            deploy:
-              steps:
-                - template: templates/okta-deprovision-steps.yml
-                  parameters:
-                    apply: true
+  - ${{ if eq(parameters.mode, 'apply') }}:
+      - ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/main') }}:
+          - stage: Apply
+            displayName: Deactivate Okta users
+            dependsOn: DryRun   # also runs after SucceededWithIssues (e.g. some users not in Okta)
+            jobs:
+              - deployment: Apply
+                displayName: Deactivate Okta users
+                environment: okta-production   # approval + branch control checks live here
+                strategy:
+                  runOnce:
+                    deploy:
+                      steps:
+                        - template: templates/okta-deprovision-steps.yml
+                          parameters:
+                            mode: apply
 
-  - ${{ else }}:
-      - job: Blocked
-        displayName: Apply refused (not on main)
-        steps:
-          - checkout: none
-          - bash: |
-              echo "##vso[task.logissue type=error]Apply runs are only allowed from main (this run: $(Build.SourceBranch)). Run a dry run instead, or merge first."
-              exit 1
-            displayName: Refuse apply from a non-main branch
+      - ${{ else }}:
+          - stage: Blocked
+            displayName: Apply refused (not on main)
+            jobs:
+              - job: Blocked
+                displayName: Apply refused (not on main)
+                steps:
+                  - checkout: none
+                  - bash: |
+                      echo "##vso[task.logissue type=error]Apply runs are only allowed from main (this run: $(Build.SourceBranch)). Run a dry run instead, or merge first."
+                      exit 1
+                    displayName: Refuse apply from a non-main branch

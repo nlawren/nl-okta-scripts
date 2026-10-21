@@ -4,9 +4,20 @@ DRY RUN BY DEFAULT: users are only looked up and reported on. Nothing in Okta
 changes unless --apply is passed.
 
 Input  (users.csv):  name, login
-Output (output.csv): name, login, status, detail
+Output (output.csv): name, login, okta_status, last_login, action, status, detail
 
-status is "success" or "error"; detail explains why.
+okta_status and last_login are as Okta had them before this run. action is
+"deactivated", "would deactivate" (dry run) or "none". status is "success" or
+"error"; detail explains why.
+
+With --apply, each user is backed up just before they're deactivated: their
+Okta record, groups and app assignments, as one JSON line per user in
+backup-<UTC time>.jsonl (or --backup). If the backup fails, the user isn't
+deactivated. The backup contains personal data; treat it like the user list.
+
+--validate is a separate, read-only mode: it looks every user up and writes a
+copy of the input with their Okta status and last login added
+(users.csv -> users-validated.csv): name, login, okta_status, last_login
 
 Environment:
     OKTA_ORG_URL    e.g. https://example.okta.com
@@ -15,17 +26,22 @@ Environment:
 Locally these come from .env (copy .env.example):
     uv run --env-file .env deactivate_users.py            # dry run
     uv run --env-file .env deactivate_users.py --apply    # make changes
+    uv run --env-file .env deactivate_users.py --validate # report statuses only
 """
 
 import argparse
+import contextlib
 import csv
+import json
 import logging
 import os
 import re
 import sys
 import time
+from datetime import UTC, datetime
+from http import HTTPStatus
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, NamedTuple, TextIO
 from urllib.parse import quote
 
 import requests
@@ -40,24 +56,54 @@ OKTA_ORG_URL: Final = os.getenv("OKTA_ORG_URL", "").strip().rstrip("/")
 LOGIN_PATTERN: Final = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 # If the first row's second column is one of these, treat the row as a header and skip it.
-HEADER_LOGIN_NAMES: Final = {"login", "login id", "loginid", "login_id", "username", "email"}
+# Compared lower-case with everything but letters removed, so "Email Address" and "E-mail" match.
+HEADER_LOGIN_NAMES: Final = {
+    "login",
+    "loginid",
+    "oktalogin",
+    "username",
+    "email",
+    "emailaddress",
+    "userprincipalname",
+    "upn",
+}
 
 # Okta's API calls a deactivated user "DEPROVISIONED" (the admin console shows "Deactivated").
 DEACTIVATED_STATUS: Final = "DEPROVISIONED"
 
 SUCCESS: Final = "success"
 ERROR: Final = "error"
-REPORT_COLUMNS: Final = ["name", "login", "status", "detail"]
+REPORT_COLUMNS: Final = ["name", "login", "okta_status", "last_login", "action", "status", "detail"]
+
+# Values of the report's action column
+DEACTIVATED: Final = "deactivated"
+WOULD_DEACTIVATE: Final = "would deactivate"
+NO_ACTION: Final = "none"
+
+USER_NOT_FOUND: Final = "User not found in Okta"
+
+# --validate: plain-English names for Okta's user statuses, and the columns of its report.
+# Okta can't tell a deleted user from one that never existed; both come back as not found.
+NOT_IN_OKTA: Final = "not in Okta"
+OKTA_STATUS_NAMES: Final = {
+    "STAGED": "pending",  # Created, but activation not started
+    "PROVISIONED": "pending",  # Activation started, user hasn't finished it
+    "ACTIVE": "active",
+    "RECOVERY": "active (password reset in progress)",
+    "PASSWORD_EXPIRED": "active (password expired)",
+    "LOCKED_OUT": "locked out",
+    "SUSPENDED": "suspended",
+    DEACTIVATED_STATUS: "deactivated",
+}
+VALIDATE_COLUMNS: Final = ["name", "login", "okta_status", "last_login"]
 
 MAX_ATTEMPTS: Final = 5  # Tries per API call before giving up
 REQUEST_TIMEOUT_SECONDS: Final = 30
+# For calls that change something, which aren't retried. Deactivating a user with many
+# app assignments can take a while.
+CHANGE_TIMEOUT_SECONDS: Final = 120
 RATE_LIMIT_HEADROOM: Final = 2  # Pause when this few requests remain in Okta's rate-limit window
 MAX_RATE_LIMIT_WAIT_SECONDS: Final = 65
-
-HTTP_UNAUTHORIZED: Final = 401
-HTTP_NOT_FOUND: Final = 404
-HTTP_TOO_MANY_REQUESTS: Final = 429
-HTTP_SERVER_ERROR: Final = 500
 
 log = logging.getLogger("okta-deprovision")
 
@@ -109,11 +155,19 @@ def make_session(token: str) -> requests.Session:
     return session
 
 
-def error_summary(resp: requests.Response) -> str:
-    """Turn an Okta error response into a short readable message."""
+def json_body(resp: requests.Response) -> dict[str, Any] | None:
+    """Return a response's JSON object, or None if it isn't one (e.g. an HTML page from a proxy)."""
     try:
         body = resp.json()
     except ValueError:
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def error_summary(resp: requests.Response) -> str:
+    """Turn an Okta error response into a short readable message."""
+    body = json_body(resp)
+    if body is None:
         return f"HTTP {resp.status_code}: {resp.text[:200]}"
     summary = body.get("errorSummary") or body.get("errorCode") or "unknown error"
     causes = "; ".join(cause.get("errorSummary", "") for cause in body.get("errorCauses", []))
@@ -143,34 +197,41 @@ def okta_request(
     method: str,
     path: str,
     params: dict[str, str] | None = None,
+    *,
+    safe_to_repeat: bool = True,
 ) -> requests.Response | None:
     """Call the Okta API, retrying on rate limits (429), server errors (5xx) and network errors.
+
+    Pass safe_to_repeat=False for calls that change something: after a 5xx or a
+    network error Okta may already have acted, so those aren't retried (429s still
+    are, because Okta rejects those without acting) and get a longer timeout.
 
     Returns the response (which may still be an error such as 404), or None if
     Okta couldn't be reached at all.
     """
     url = f"{OKTA_ORG_URL}/api/v1{path}"
+    timeout = REQUEST_TIMEOUT_SECONDS if safe_to_repeat else CHANGE_TIMEOUT_SECONDS
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         is_last_attempt = attempt == MAX_ATTEMPTS
 
         try:
-            resp = session.request(method, url, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
+            resp = session.request(method, url, params=params, timeout=timeout)
         except requests.RequestException as exc:
-            if is_last_attempt:
+            if is_last_attempt or not safe_to_repeat:
                 log.warning("%s %s failed after %d attempts: %s", method, path, attempt, exc)
                 return None
             log.warning("%s %s failed (%s); retrying in %ss", method, path, exc, 2**attempt)
             time.sleep(2**attempt)
             continue
 
-        if resp.status_code == HTTP_TOO_MANY_REQUESTS and not is_last_attempt:
+        if resp.status_code == HTTPStatus.TOO_MANY_REQUESTS and not is_last_attempt:
             wait = seconds_until_reset(resp)
             log.warning("Rate limited on %s %s; waiting %.0fs", method, path, wait)
             time.sleep(wait)
             continue
 
-        if resp.status_code >= HTTP_SERVER_ERROR and not is_last_attempt:
+        if resp.status_code >= HTTPStatus.INTERNAL_SERVER_ERROR and safe_to_repeat and not is_last_attempt:
             log.warning("%s %s returned %s; retrying in %ss", method, path, resp.status_code, 2**attempt)
             time.sleep(2**attempt)
             continue
@@ -190,10 +251,16 @@ def who_am_i(session: requests.Session) -> str | None:
     if not resp.ok:
         log.error("Preflight check against %s failed (%s)", OKTA_ORG_URL, error_summary(resp))
         return None
-    return resp.json().get("profile", {}).get("login", "unknown")
+    body = json_body(resp)
+    if body is None:
+        log.error(
+            "%s didn't answer like an Okta org (HTTP %s, not JSON); check OKTA_ORG_URL", OKTA_ORG_URL, resp.status_code
+        )
+        return None
+    return body.get("profile", {}).get("login", "unknown")
 
 
-def look_up_user(session: requests.Session, login: str) -> tuple[dict[str, Any] | None, str, bool]:
+def look_up_user(session: requests.Session, login: str) -> tuple[dict[str, Any] | None, str, bool]:  # noqa: PLR0911 - one return per outcome
     """Find a user in Okta by login.
 
     Returns (user, problem, stop):
@@ -205,14 +272,16 @@ def look_up_user(session: requests.Session, login: str) -> tuple[dict[str, Any] 
 
     if resp is None:
         return None, "Lookup failed: could not reach Okta", False
-    if resp.status_code == HTTP_UNAUTHORIZED:
+    if resp.status_code == HTTPStatus.UNAUTHORIZED:
         return None, f"Okta rejected the API token ({error_summary(resp)})", True
-    if resp.status_code == HTTP_NOT_FOUND:
-        return None, "User not found in Okta", False
+    if resp.status_code == HTTPStatus.NOT_FOUND:
+        return None, USER_NOT_FOUND, False
     if not resp.ok:
         return None, f"Lookup failed: {error_summary(resp)}", False
 
-    user = resp.json()
+    user = json_body(resp)
+    if user is None:
+        return None, f"Lookup failed: Okta's response wasn't JSON (HTTP {resp.status_code})", False
 
     # Okta also matches the start of a login (e.g. "jane" finds "jane@example.com"),
     # so make sure we got exactly the user we asked for.
@@ -226,6 +295,9 @@ def look_up_user(session: requests.Session, login: str) -> tuple[dict[str, Any] 
 def send_deactivation(session: requests.Session, user_id: str) -> tuple[str, bool]:
     """Ask Okta to deactivate a user, without emailing the admin.
 
+    The request isn't retried. If it times out or Okta returns a server error,
+    Okta may still have deactivated the user, so check before reporting a failure.
+
     Returns (problem, stop): problem is "" on success; stop is True if the token was rejected.
     """
     resp = okta_request(
@@ -233,20 +305,134 @@ def send_deactivation(session: requests.Session, user_id: str) -> tuple[str, boo
         "POST",
         f"/users/{quote(user_id, safe='')}/lifecycle/deactivate",
         params={"sendEmail": "false"},
+        safe_to_repeat=False,
     )
 
-    if resp is None:
-        return "could not reach Okta", False
-    if resp.status_code == HTTP_UNAUTHORIZED:
+    if resp is not None and resp.status_code == HTTPStatus.UNAUTHORIZED:
         return f"Okta rejected the API token ({error_summary(resp)})", True
-    if not resp.ok:
-        return error_summary(resp), False
+    if resp is not None and resp.ok:
+        return "", False
+
+    problem = "could not reach Okta" if resp is None else error_summary(resp)
+    if resp is None or resp.status_code >= HTTPStatus.INTERNAL_SERVER_ERROR:
+        if is_deactivated(session, user_id):
+            log.warning("Deactivate request for %s failed (%s), but Okta shows the user deactivated", user_id, problem)
+            return "", False
+        problem += "; Okta doesn't show the user as deactivated"
+    return problem, False
+
+
+def is_deactivated(session: requests.Session, user_id: str) -> bool:
+    """Return True if Okta shows the user deactivated, or finishing deactivation."""
+    resp = okta_request(session, "GET", f"/users/{quote(user_id, safe='')}")
+    user = json_body(resp) if resp is not None and resp.ok else None
+    return user is not None and DEACTIVATED_STATUS in {user.get("status"), user.get("transitioningToStatus")}
+
+
+def get_all(
+    session: requests.Session,
+    path: str,
+    params: dict[str, str] | None = None,
+) -> tuple[list[dict[str, Any]] | None, str, bool]:
+    """GET every page of an Okta list.
+
+    Returns (items, problem, stop): items is None if any page failed, problem says
+    why; stop is True if the token was rejected.
+    """
+    items: list[dict[str, Any]] = []
+    api_prefix = f"{OKTA_ORG_URL}/api/v1/"
+    next_path: str | None = path
+    while next_path:
+        resp = okta_request(session, "GET", next_path, params)
+        if resp is None:
+            return None, "could not reach Okta", False
+        if resp.status_code == HTTPStatus.UNAUTHORIZED:
+            return None, f"Okta rejected the API token ({error_summary(resp)})", True
+        if not resp.ok:
+            return None, error_summary(resp), False
+        try:
+            page = resp.json()
+        except ValueError:
+            page = None
+        if not isinstance(page, list):
+            return None, f"Okta's response wasn't a JSON list (HTTP {resp.status_code})", False
+        items.extend(page)
+
+        # Okta links to the next page with a full URL; only follow it within this org's API,
+        # since the token goes with every request
+        next_url = resp.links.get("next", {}).get("url", "")
+        if next_url and not next_url.startswith(api_prefix):
+            return None, f"Okta's next-page link points outside {OKTA_ORG_URL}: {next_url}", False
+        next_path = next_url.removeprefix(api_prefix[:-1]) or None
+        params = None  # The next-page link already carries them
+    return items, "", False
+
+
+def open_backup(path: Path) -> TextIO:
+    """Open the backup file for adding to, readable by its owner only. Never overwrites an earlier backup."""
+    return os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "a", encoding="utf-8")
+
+
+def write_backup(session: requests.Session, user: dict[str, Any], backup: TextIO) -> tuple[str, bool]:
+    """Save a user's Okta record, groups and app assignments as one JSON line in the backup.
+
+    Called just before the user is deactivated. Returns (problem, stop): problem is
+    "" once the line is safely on disk; stop is True if the token was rejected.
+    """
+    user_id = user["id"]
+    groups, problem, stop = get_all(session, f"/users/{quote(user_id, safe='')}/groups")
+    if groups is None:
+        return f"could not list groups: {problem}", stop
+
+    # expand=user/<id> embeds each app's assignment for this user, including its
+    # scope: USER (assigned directly) or GROUP (assigned through a group)
+    app_params = {"filter": f'user.id eq "{user_id}"', "expand": f"user/{user_id}", "limit": "200"}
+    apps, problem, stop = get_all(session, "/apps", app_params)
+    if apps is None:
+        return f"could not list apps: {problem}", stop
+
+    record = {
+        "backed_up_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "org": OKTA_ORG_URL,
+        "login": user.get("profile", {}).get("login", ""),
+        "user": without_links(user),
+        "groups": [
+            {"id": group.get("id"), "name": group.get("profile", {}).get("name"), "type": group.get("type")}
+            for group in groups
+        ],
+        "apps": [
+            {
+                "id": app.get("id"),
+                "name": app.get("name"),
+                "label": app.get("label"),
+                "status": app.get("status"),
+                "assignment": without_links(app.get("_embedded", {}).get("user", {})),
+            }
+            for app in apps
+        ],
+    }
+    try:
+        backup.write(json.dumps(record) + "\n")
+        backup.flush()
+        os.fsync(backup.fileno())  # On disk before the user is deactivated
+    except OSError as exc:
+        return f"could not write the backup file: {exc}", True
     return "", False
+
+
+def without_links(obj: dict[str, Any]) -> dict[str, Any]:
+    """Drop Okta's _links (API URLs, not data) from an object."""
+    return {key: value for key, value in obj.items() if key != "_links"}
 
 
 # ---------------------------------------------------------------------------
 # Reading and checking the CSV
 # ---------------------------------------------------------------------------
+
+
+def safe_cells(cells: list[str]) -> list[str]:
+    """Stop spreadsheet apps running report cells as formulas, by prefixing risky ones with '."""
+    return [f"'{cell}" if cell.startswith(("=", "+", "-", "@", "\t", "\r")) else cell for cell in cells]
 
 
 def read_rows(path: Path) -> list[dict[str, str]]:
@@ -263,7 +449,7 @@ def read_rows(path: Path) -> list[dict[str, str]]:
             name = cells[0] if len(cells) > 0 else ""
             login = cells[1] if len(cells) > 1 else ""
 
-            if index == 0 and login.lower() in HEADER_LOGIN_NAMES:
+            if index == 0 and re.sub(r"[^a-z]", "", login.lower()) in HEADER_LOGIN_NAMES:
                 log.info("Skipping header row")
                 continue
 
@@ -296,26 +482,62 @@ def validate_row(row: dict[str, str], seen_logins: set[str]) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def process_row(session: requests.Session, row: dict[str, str], *, apply: bool) -> tuple[str, str, bool]:
-    """Look up one user and, if apply is True, deactivate them.
+class Outcome(NamedTuple):
+    """What happened to one row, as written to the report."""
 
-    Returns (status, detail, stop): stop is True if the whole run should stop.
+    status: str
+    detail: str
+    okta_status: str = ""
+    last_login: str = ""
+    action: str = NO_ACTION
+    stop: bool = False  # True if the whole run should stop
+
+
+def describe_user(user: dict[str, Any]) -> tuple[str, str]:
+    """Return a user's (okta_status, last_login) as the reports show them."""
+    status = user.get("status", "UNKNOWN")
+    last_login = user.get("lastLogin") or "never"  # ISO 8601, UTC
+    return OKTA_STATUS_NAMES.get(status, status.lower()), last_login
+
+
+def process_row(  # noqa: PLR0911 - one return per outcome
+    session: requests.Session,
+    row: dict[str, str],
+    *,
+    me: str,
+    backup: TextIO | None,
+) -> Outcome:
+    """Look up one user and, unless this is a dry run, back them up and deactivate them.
+
+    me is the login of the token's owner, which is never deactivated: that would
+    revoke the token and stop the run partway through. backup is where each user
+    is saved before being deactivated; None means a dry run.
     """
     user, problem, stop = look_up_user(session, row["login"])
     if user is None:
-        return ERROR, problem, stop
+        okta_status = NOT_IN_OKTA if problem == USER_NOT_FOUND else ""
+        return Outcome(ERROR, problem, okta_status, stop=stop)
 
+    okta_status, last_login = describe_user(user)
     current_status = user.get("status", "UNKNOWN")
     if current_status == DEACTIVATED_STATUS:
-        return ERROR, "Already deactivated", False
+        return Outcome(SUCCESS, "Already deactivated; nothing to do", okta_status, last_login)
+    if row["login"].casefold() == me.casefold():
+        detail = "Skipped: this is the API token's own account (deactivate it by hand after the run)"
+        return Outcome(ERROR, detail, okta_status, last_login)
 
-    if not apply:
-        return SUCCESS, f"Dry run: would deactivate (current status {current_status})", False
+    if backup is None:
+        detail = f"Dry run: would deactivate (current status {current_status})"
+        return Outcome(SUCCESS, detail, okta_status, last_login, WOULD_DEACTIVATE)
+
+    problem, stop = write_backup(session, user, backup)
+    if problem:
+        return Outcome(ERROR, f"Not deactivated: backup failed ({problem})", okta_status, last_login, stop=stop)
 
     problem, stop = send_deactivation(session, user["id"])
     if problem:
-        return ERROR, f"Deactivation failed: {problem}", stop
-    return SUCCESS, f"Deactivated (was {current_status})", False
+        return Outcome(ERROR, f"Deactivation failed: {problem}", okta_status, last_login, stop=stop)
+    return Outcome(SUCCESS, f"Deactivated (was {current_status})", okta_status, last_login, DEACTIVATED)
 
 
 def process_all(
@@ -323,9 +545,12 @@ def process_all(
     rows: list[dict[str, str]],
     output: Path,
     *,
-    apply: bool,
+    me: str,
+    backup_path: Path | None,
 ) -> tuple[dict[str, int], bool]:
-    """Process every row and write the report as we go.
+    """Process every row and write the report (and, unless dry run, the backup) as we go.
+
+    backup_path None means a dry run: nothing is backed up or deactivated.
 
     Returns (counts, stopped): counts of success/error, and whether the run stopped early.
     """
@@ -333,26 +558,90 @@ def process_all(
     seen_logins: set[str] = set()
     stopped = False
 
-    with output.open("w", newline="", encoding="utf-8") as fh:
+    with (
+        output.open("w", newline="", encoding="utf-8") as fh,
+        open_backup(backup_path) if backup_path else contextlib.nullcontext() as backup,
+    ):
         writer = csv.writer(fh)
         writer.writerow(REPORT_COLUMNS)
 
         for row in rows:
             if stopped:
-                status, detail = ERROR, "Not processed (run stopped early)"
+                outcome = Outcome(ERROR, "Not processed (run stopped early)")
             else:
                 problem = validate_row(row, seen_logins)
                 if problem:
-                    status, detail = ERROR, problem
+                    outcome = Outcome(ERROR, problem)
                 else:
-                    status, detail, stopped = process_row(session, row, apply=apply)
+                    outcome = process_row(session, row, me=me, backup=backup)
+                    stopped = outcome.stop
                     if stopped:
-                        log.error("Stopping run: %s", detail)
+                        log.error("Stopping run: %s", outcome.detail)
 
-            writer.writerow([row["name"], row["login"], status, detail])
+            writer.writerow(
+                safe_cells(
+                    [
+                        row["name"],
+                        row["login"],
+                        outcome.okta_status,
+                        outcome.last_login,
+                        outcome.action,
+                        outcome.status,
+                        outcome.detail,
+                    ],
+                ),
+            )
             fh.flush()  # Keep the report up to date in case the job is cancelled
-            counts[status] += 1
-            log.info("%-7s %s: %s", status, row["login"] or "<blank>", detail)
+            counts[outcome.status] += 1
+            log.info("%-7s %s: %s", outcome.status, row["login"] or "<blank>", outcome.detail)
+
+    return counts, stopped
+
+
+def validate_user(session: requests.Session, login: str) -> tuple[str, str, bool]:
+    """Look up one user for --validate, changing nothing.
+
+    Returns (okta_status, last_login, stop): stop is True if the whole run should stop.
+    """
+    user, problem, stop = look_up_user(session, login)
+    if user is None:
+        if problem == USER_NOT_FOUND:
+            return NOT_IN_OKTA, "", False
+        return f"error: {problem}", "", stop
+    return (*describe_user(user), False)
+
+
+def validate_all(session: requests.Session, rows: list[dict[str, str]], output: Path) -> tuple[dict[str, int], bool]:
+    """Look up every row and write the validated copy of the CSV as we go.
+
+    Returns (counts, stopped): how many rows got each okta_status, and whether the run stopped early.
+    """
+    counts: dict[str, int] = {}
+    seen_logins: set[str] = set()
+    stopped = False
+
+    with output.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(VALIDATE_COLUMNS)
+
+        for row in rows:
+            last_login = ""
+            if stopped:
+                okta_status = "error: not checked (run stopped early)"
+            else:
+                problem = validate_row(row, seen_logins)
+                if problem:
+                    okta_status = f"error: {problem}"
+                else:
+                    okta_status, last_login, stopped = validate_user(session, row["login"])
+                    if stopped:
+                        log.error("Stopping run: %s", okta_status)
+
+            writer.writerow(safe_cells([row["name"], row["login"], okta_status, last_login]))
+            fh.flush()  # Keep the report up to date in case the job is cancelled
+            key = ERROR if okta_status.startswith("error:") else okta_status
+            counts[key] = counts.get(key, 0) + 1
+            log.info("%-12s %s %s", okta_status, row["login"] or "<blank>", last_login)
 
     return counts, stopped
 
@@ -366,13 +655,39 @@ def parse_args() -> argparse.Namespace:
     """Read command-line arguments."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--input", type=Path, default=Path("users.csv"), help="input CSV (default: users.csv)")
-    parser.add_argument("--output", type=Path, default=Path("output.csv"), help="report CSV (default: output.csv)")
     parser.add_argument(
+        "--output",
+        type=Path,
+        help="report CSV (default: output.csv, or <input>-validated.csv with --validate)",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--apply",
         action="store_true",
         help="actually deactivate users (without this, the run is a dry run and changes nothing)",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--backup",
+        type=Path,
+        help="with --apply: where to back users up before deactivating them (default: backup-<UTC time>.jsonl)",
+    )
+    mode.add_argument(
+        "--validate",
+        action="store_true",
+        help="only report each user's Okta status and last login; changes nothing",
+    )
+    args = parser.parse_args()
+    if args.backup and not args.apply:
+        parser.error("--backup only applies with --apply")
+    if args.apply and args.backup is None:
+        args.backup = Path(f"backup-{datetime.now(UTC):%Y%m%dT%H%M%SZ}.jsonl")
+    if args.output is None:
+        args.output = (
+            args.input.with_name(f"{args.input.stem}-validated{args.input.suffix}")
+            if args.validate
+            else Path("output.csv")
+        )
+    return args
 
 
 def check_config(input_path: Path, token: str) -> str | None:
@@ -385,6 +700,33 @@ def check_config(input_path: Path, token: str) -> str | None:
     if not input_path.is_file():
         return f"Input file not found: {input_path}"
     return None
+
+
+def write_unprocessed_report(rows: list[dict[str, str]], output: Path, reason: str, *, validate: bool) -> None:
+    """Write a report marking every row as not processed, so a failed run still has one to publish."""
+    with output.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(VALIDATE_COLUMNS if validate else REPORT_COLUMNS)
+        for row in rows:
+            if validate:
+                cells = [row["name"], row["login"], f"error: not checked ({reason})", ""]
+            else:
+                cells = [row["name"], row["login"], "", "", NO_ACTION, ERROR, f"Not processed ({reason})"]
+            writer.writerow(safe_cells(cells))
+
+
+def run_validate(session: requests.Session, rows: list[dict[str, str]], output: Path) -> int:
+    """Run --validate and return main's exit code."""
+    log.warning("VALIDATE: looking users up only; no changes will be made in Okta.")
+    counts, stopped = validate_all(session, rows, output)
+    summary = ", ".join(f"{count} {status}" for status, count in sorted(counts.items()))
+    log.info("Done (validate): %s. Report written to %s", summary, output)
+    if stopped:
+        return 1
+    if counts.get(ERROR):
+        ado_command(f"task.logissue type=warning]{counts[ERROR]} row(s) could not be checked; see {output}")
+        ado_command("task.complete result=SucceededWithIssues;]")
+    return 0
 
 
 def main() -> int:
@@ -403,18 +745,26 @@ def main() -> int:
         log.error("No rows found in %s", args.input)
         return 2
 
+    if args.apply:
+        # Create it up front, so even a run that fails at preflight has one to publish
+        open_backup(args.backup).close()
+
     session = make_session(token)
     me = who_am_i(session)
     if me is None:
-        return 1
+        write_unprocessed_report(rows, args.output, "preflight check failed; see the log", validate=args.validate)
+        return 2
 
     log.info("Authenticated as %s; %d rows to process", me, len(rows))
+    if args.validate:
+        return run_validate(session, rows, args.output)
+
     if args.apply:
-        log.warning("APPLY: users will be deactivated in %s", OKTA_ORG_URL)
+        log.warning("APPLY: users will be deactivated in %s, after backing each up to %s", OKTA_ORG_URL, args.backup)
     else:
         log.warning("DRY RUN: no changes will be made in Okta. Pass --apply to deactivate users.")
 
-    counts, stopped = process_all(session, rows, args.output, apply=args.apply)
+    counts, stopped = process_all(session, rows, args.output, me=me, backup_path=args.backup)  # None unless --apply
 
     log.info(
         "Done (%s): %d success, %d error. Report written to %s",

@@ -1,9 +1,13 @@
-# Steps shared by the dry-run and apply jobs in okta-deprovision.yml.
+# Steps shared by the dry-run, validate and apply jobs in okta-deprovision.yml.
 # Everything runs inside okta-deprovision/, which is self-contained.
 parameters:
-  - name: apply
-    type: boolean
-    default: false
+  - name: mode
+    type: string
+    default: dry-run
+    values:
+      - dry-run
+      - validate
+      - apply
 
 steps:
   - bash: |
@@ -35,8 +39,12 @@ steps:
     env:
       UV_CACHE_DIR: $(Pipeline.Workspace)/.uv-cache
 
-  - bash: uv run --no-sync deactivate_users.py --input users.csv --output output.csv ${{ iif(parameters.apply, '--apply', '') }}
-    displayName: ${{ iif(parameters.apply, 'Deactivate Okta users', 'Dry run - report only') }}
+  # validate writes users-validated.csv; dry-run and apply write output.csv
+  - bash: >-
+      uv run --no-sync deactivate_users.py --input users.csv
+      --output ${{ iif(eq(parameters.mode, 'validate'), 'users-validated.csv', 'output.csv') }}
+      ${{ iif(eq(parameters.mode, 'apply'), '--apply --backup backup.jsonl', iif(eq(parameters.mode, 'validate'), '--validate', '')) }}
+    displayName: ${{ iif(eq(parameters.mode, 'apply'), 'Deactivate Okta users', iif(eq(parameters.mode, 'validate'), 'Validate - Okta status report only', 'Dry run - report only')) }}
     workingDirectory: $(Build.SourcesDirectory)/okta-deprovision
     env:
       OKTA_ORG_URL: $(OKTA_ORG_URL)
@@ -49,7 +57,16 @@ steps:
     env:
       UV_CACHE_DIR: $(Pipeline.Workspace)/.uv-cache
 
-  - publish: $(Build.SourcesDirectory)/okta-deprovision/output.csv
-    artifact: okta-deprovision-${{ iif(parameters.apply, 'applied', 'dry-run') }}-report-$(System.JobAttempt)
+  - publish: $(Build.SourcesDirectory)/okta-deprovision/${{ iif(eq(parameters.mode, 'validate'), 'users-validated.csv', 'output.csv') }}
+    artifact: okta-deprovision-${{ iif(eq(parameters.mode, 'apply'), 'applied', parameters.mode) }}-report-$(System.JobAttempt)
     displayName: Publish report
     condition: always()
+
+  # Apply backs each user up (Okta record, groups, app assignments) before
+  # deactivating them. It holds personal data: anyone who can view this
+  # pipeline's runs can download it, and it's kept per the retention policy.
+  - ${{ if eq(parameters.mode, 'apply') }}:
+      - publish: $(Build.SourcesDirectory)/okta-deprovision/backup.jsonl
+        artifact: okta-deprovision-backup-$(System.JobAttempt)
+        displayName: Publish backup
+        condition: always()
