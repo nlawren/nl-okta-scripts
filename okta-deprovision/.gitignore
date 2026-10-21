@@ -4,3 +4,5 @@
 __pycache__/
 .ruff_cache/
 output.csv
+*-validated.csv
+backup*.jsonl
