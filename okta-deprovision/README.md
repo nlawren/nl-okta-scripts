@@ -1,10 +1,21 @@
 # okta-deprovision
 
-Deactivates the Okta users listed in `users.csv` and writes `output.csv`
-(name, login, okta_status, last_login, action, status, detail).
-`okta_status` and `last_login` are as Okta had them before the run; `action` is
-`deactivated`, `would deactivate` (dry run) or `none`. Self-contained: nothing here is imported from
-elsewhere in the repo, and nothing elsewhere depends on it.
+Deactivates the Okta users listed in `users.csv` (name, email) and writes
+`output.csv` (name, email, okta_login, okta_status, last_login, action, status,
+detail). Self-contained: nothing here is imported from elsewhere in the repo,
+and nothing elsewhere depends on it.
+
+Users are matched on their Okta **primary email** (`profile.email`) by
+default, since the Okta login can be on a different domain. `okta_login` is the
+login of the user found. If more than one Okta user has the same primary email,
+the row is an error listing their logins, and none of them is deactivated.
+
+If your CSV has Okta logins instead, pass `--match-by login` (in the pipeline,
+set **Match users by** to `login`). The second column is then named `login` in
+every output instead of `email`.
+
+`okta_login`, `okta_status` and `last_login` are as Okta had them before the
+run; `action` is `deactivated`, `would deactivate` (dry run) or `none`.
 
 **Dry run by default.** Without `--apply` the script only looks users up and
 reports what it would do.
@@ -20,9 +31,11 @@ uv run --env-file .env deactivate_users.py --apply    # deactivates users
 uv run --env-file .env deactivate_users.py --validate # status report only
 ```
 
-`--validate` is read-only. It writes a copy of the input with two columns
+`--validate` is read-only. It writes a copy of the input with three columns
 added (`users.csv` -> `users-validated.csv`):
 
+- `okta_login`: the Okta login of the user with that primary email, or blank
+  if there isn't exactly one.
 - `okta_status`: `not in Okta`, `deactivated`, `pending`, `active`,
   `suspended`, `locked out`, or `error: <reason>` if the row couldn't be
   checked. Okta can't tell a deleted user from one that never existed, so

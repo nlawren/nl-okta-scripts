@@ -3,10 +3,13 @@
 DRY RUN BY DEFAULT: users are only looked up and reported on. Nothing in Okta
 changes unless --apply is passed.
 
-Input  (users.csv):  name, login
-Output (output.csv): name, login, okta_status, last_login, action, status, detail
+Input  (users.csv):  name, email
+Output (output.csv): name, email, okta_login, okta_status, last_login, action, status, detail
 
-okta_status and last_login are as Okta had them before this run. action is
+Users are found by their Okta primary email (profile.email) by default, or by
+their Okta login with --match-by login (the second column is then a login, and
+named "login" in the outputs). okta_login is the login of the user found. okta_login, okta_status and
+last_login are as Okta had them before this run. action is
 "deactivated", "would deactivate" (dry run) or "none". status is "success" or
 "error"; detail explains why.
 
@@ -17,7 +20,7 @@ deactivated. The backup contains personal data; treat it like the user list.
 
 --validate is a separate, read-only mode: it looks every user up and writes a
 copy of the input with their Okta status and last login added
-(users.csv -> users-validated.csv): name, login, okta_status, last_login
+(users.csv -> users-validated.csv): name, email, okta_login, okta_status, last_login
 
 Environment:
     OKTA_ORG_URL    e.g. https://example.okta.com
@@ -52,18 +55,23 @@ import requests
 
 OKTA_ORG_URL: Final = os.getenv("OKTA_ORG_URL", "").strip().rstrip("/")
 
-# Okta logins are email-formatted by default. Relax this if your org allows other formats.
-LOGIN_PATTERN: Final = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# What --match-by can match the CSV's second column on: the Okta profile field, and how messages name it
+MATCH_FIELDS: Final = {"email": "primary email", "login": "login"}
+
+# Emails and Okta logins (which are email-formatted by default). Quotes and backslashes
+# aren't allowed, so a value can go straight into an Okta search expression.
+MATCH_PATTERN: Final = re.compile(r'^[^@\s"\\]+@[^@\s"\\]+\.[^@\s"\\]+$')
 
 # If the first row's second column is one of these, treat the row as a header and skip it.
 # Compared lower-case with everything but letters removed, so "Email Address" and "E-mail" match.
-HEADER_LOGIN_NAMES: Final = {
+HEADER_NAMES: Final = {
+    "email",
+    "emailaddress",
+    "primaryemail",
     "login",
     "loginid",
     "oktalogin",
     "username",
-    "email",
-    "emailaddress",
     "userprincipalname",
     "upn",
 }
@@ -73,14 +81,13 @@ DEACTIVATED_STATUS: Final = "DEPROVISIONED"
 
 SUCCESS: Final = "success"
 ERROR: Final = "error"
-REPORT_COLUMNS: Final = ["name", "login", "okta_status", "last_login", "action", "status", "detail"]
+# Report columns after "name" and the matched field ("email" or "login")
+REPORT_COLUMNS: Final = ["okta_login", "okta_status", "last_login", "action", "status", "detail"]
 
 # Values of the report's action column
 DEACTIVATED: Final = "deactivated"
 WOULD_DEACTIVATE: Final = "would deactivate"
 NO_ACTION: Final = "none"
-
-USER_NOT_FOUND: Final = "User not found in Okta"
 
 # --validate: plain-English names for Okta's user statuses, and the columns of its report.
 # Okta can't tell a deleted user from one that never existed; both come back as not found.
@@ -95,7 +102,7 @@ OKTA_STATUS_NAMES: Final = {
     "SUSPENDED": "suspended",
     DEACTIVATED_STATUS: "deactivated",
 }
-VALIDATE_COLUMNS: Final = ["name", "login", "okta_status", "last_login"]
+VALIDATE_COLUMNS: Final = ["okta_login", "okta_status", "last_login"]
 
 MAX_ATTEMPTS: Final = 5  # Tries per API call before giving up
 REQUEST_TIMEOUT_SECONDS: Final = 30
@@ -260,36 +267,27 @@ def who_am_i(session: requests.Session) -> str | None:
     return body.get("profile", {}).get("login", "unknown")
 
 
-def look_up_user(session: requests.Session, login: str) -> tuple[dict[str, Any] | None, str, bool]:  # noqa: PLR0911 - one return per outcome
-    """Find a user in Okta by login.
+def look_up_user(session: requests.Session, value: str, match_by: str) -> tuple[dict[str, Any] | None, str, bool]:
+    """Find a user in Okta whose profile.<match_by> (email or login) is value.
+
+    Okta doesn't require primary emails to be unique, so more than one match is a
+    problem rather than a guess. Search results include deactivated users.
 
     Returns (user, problem, stop):
-        user     the user's details from Okta, or None if they couldn't be found
-        problem  why the user couldn't be found ("" if they were)
+        user     the user's details from Okta, or None if exactly one couldn't be found
+        problem  why not, or "" if found or if there's simply no such user
         stop     True if the token was rejected, so the whole run should stop
     """
-    resp = okta_request(session, "GET", f"/users/{quote(login, safe='')}")
+    users, problem, stop = get_all(session, "/users", {"search": f'profile.{match_by} eq "{value}"'})
+    if users is None:
+        return None, problem if stop else f"Lookup failed: {problem}", stop
 
-    if resp is None:
-        return None, "Lookup failed: could not reach Okta", False
-    if resp.status_code == HTTPStatus.UNAUTHORIZED:
-        return None, f"Okta rejected the API token ({error_summary(resp)})", True
-    if resp.status_code == HTTPStatus.NOT_FOUND:
-        return None, USER_NOT_FOUND, False
-    if not resp.ok:
-        return None, f"Lookup failed: {error_summary(resp)}", False
-
-    user = json_body(resp)
-    if user is None:
-        return None, f"Lookup failed: Okta's response wasn't JSON (HTTP {resp.status_code})", False
-
-    # Okta also matches the start of a login (e.g. "jane" finds "jane@example.com"),
-    # so make sure we got exactly the user we asked for.
-    actual_login = user.get("profile", {}).get("login", "")
-    if actual_login.casefold() != login.casefold():
-        return None, f"Lookup returned a different user ({actual_login}); skipped", False
-
-    return user, "", False
+    # Okta's search is case-insensitive; check the match is exact apart from case
+    matches = [user for user in users if user.get("profile", {}).get(match_by, "").casefold() == value.casefold()]
+    if len(matches) > 1:
+        logins = ", ".join(sorted(user.get("profile", {}).get("login", "?") for user in matches))
+        return None, f"{len(matches)} Okta users have this {MATCH_FIELDS[match_by]} ({logins}); skipped", False
+    return (matches[0] if matches else None), "", False
 
 
 def send_deactivation(session: requests.Session, user_id: str) -> tuple[str, bool]:
@@ -395,6 +393,7 @@ def write_backup(session: requests.Session, user: dict[str, Any], backup: TextIO
         "backed_up_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "org": OKTA_ORG_URL,
         "login": user.get("profile", {}).get("login", ""),
+        "email": user.get("profile", {}).get("email", ""),
         "user": without_links(user),
         "groups": [
             {"id": group.get("id"), "name": group.get("profile", {}).get("name"), "type": group.get("type")}
@@ -436,7 +435,9 @@ def safe_cells(cells: list[str]) -> list[str]:
 
 
 def read_rows(path: Path) -> list[dict[str, str]]:
-    """Read the input CSV into a list of {"line", "name", "login"} dictionaries.
+    """Read the input CSV into a list of {"line", "name", "match"} dictionaries.
+
+    match is the second column: the email or login to find the user by (see --match-by).
 
     Skips a header row if there is one. Blank rows are kept so they show up in the report.
     """
@@ -447,33 +448,33 @@ def read_rows(path: Path) -> list[dict[str, str]]:
         for index, raw in enumerate(reader):
             cells = [cell.strip() for cell in raw]
             name = cells[0] if len(cells) > 0 else ""
-            login = cells[1] if len(cells) > 1 else ""
+            match = cells[1] if len(cells) > 1 else ""
 
-            if index == 0 and re.sub(r"[^a-z]", "", login.lower()) in HEADER_LOGIN_NAMES:
+            if index == 0 and re.sub(r"[^a-z]", "", match.lower()) in HEADER_NAMES:
                 log.info("Skipping header row")
                 continue
 
-            rows.append({"line": str(reader.line_num), "name": name, "login": login})
+            rows.append({"line": str(reader.line_num), "name": name, "match": match})
     return rows
 
 
-def validate_row(row: dict[str, str], seen_logins: set[str]) -> str | None:
+def validate_row(row: dict[str, str], seen: set[str], match_by: str) -> str | None:
     """Return why a row can't be processed, or None if it looks valid.
 
-    seen_logins is updated with each valid login, to catch duplicates.
+    seen is updated with each valid email or login, to catch duplicates.
     """
     line = row["line"]
-    if not row["name"] and not row["login"]:
+    if not row["name"] and not row["match"]:
         return f"Blank row (line {line})"
-    if not row["login"]:
-        return f"Missing login ID (line {line})"
-    if not LOGIN_PATTERN.fullmatch(row["login"]):
-        return f"Invalid login ID format (line {line})"
+    if not row["match"]:
+        return f"Missing {match_by} (line {line})"
+    if not MATCH_PATTERN.fullmatch(row["match"]):
+        return f"Invalid {match_by} format (line {line})"
 
-    key = row["login"].casefold()  # Okta logins aren't case-sensitive
-    if key in seen_logins:
-        return f"Duplicate login ID in input (line {line})"
-    seen_logins.add(key)
+    key = row["match"].casefold()  # Okta matches emails and logins case-insensitively
+    if key in seen:
+        return f"Duplicate {match_by} in input (line {line})"
+    seen.add(key)
     return None
 
 
@@ -487,17 +488,19 @@ class Outcome(NamedTuple):
 
     status: str
     detail: str
+    okta_login: str = ""
     okta_status: str = ""
     last_login: str = ""
     action: str = NO_ACTION
     stop: bool = False  # True if the whole run should stop
 
 
-def describe_user(user: dict[str, Any]) -> tuple[str, str]:
-    """Return a user's (okta_status, last_login) as the reports show them."""
+def describe_user(user: dict[str, Any]) -> tuple[str, str, str]:
+    """Return a user's (okta_login, okta_status, last_login) as the reports show them."""
+    okta_login = user.get("profile", {}).get("login", "")
     status = user.get("status", "UNKNOWN")
     last_login = user.get("lastLogin") or "never"  # ISO 8601, UTC
-    return OKTA_STATUS_NAMES.get(status, status.lower()), last_login
+    return okta_login, OKTA_STATUS_NAMES.get(status, status.lower()), last_login
 
 
 def process_row(  # noqa: PLR0911 - one return per outcome
@@ -506,6 +509,7 @@ def process_row(  # noqa: PLR0911 - one return per outcome
     *,
     me: str,
     backup: TextIO | None,
+    match_by: str,
 ) -> Outcome:
     """Look up one user and, unless this is a dry run, back them up and deactivate them.
 
@@ -513,67 +517,69 @@ def process_row(  # noqa: PLR0911 - one return per outcome
     revoke the token and stop the run partway through. backup is where each user
     is saved before being deactivated; None means a dry run.
     """
-    user, problem, stop = look_up_user(session, row["login"])
+    user, problem, stop = look_up_user(session, row["match"], match_by)
+    if user is None and not problem:
+        return Outcome(ERROR, f"No Okta user has this {MATCH_FIELDS[match_by]}", okta_status=NOT_IN_OKTA)
     if user is None:
-        okta_status = NOT_IN_OKTA if problem == USER_NOT_FOUND else ""
-        return Outcome(ERROR, problem, okta_status, stop=stop)
+        return Outcome(ERROR, problem, stop=stop)
 
-    okta_status, last_login = describe_user(user)
+    described = describe_user(user)  # okta_login, okta_status, last_login
+    okta_login = described[0]
     current_status = user.get("status", "UNKNOWN")
     if current_status == DEACTIVATED_STATUS:
-        return Outcome(SUCCESS, "Already deactivated; nothing to do", okta_status, last_login)
-    if row["login"].casefold() == me.casefold():
+        return Outcome(SUCCESS, "Already deactivated; nothing to do", *described)
+    if okta_login.casefold() == me.casefold():
         detail = "Skipped: this is the API token's own account (deactivate it by hand after the run)"
-        return Outcome(ERROR, detail, okta_status, last_login)
+        return Outcome(ERROR, detail, *described)
 
     if backup is None:
         detail = f"Dry run: would deactivate (current status {current_status})"
-        return Outcome(SUCCESS, detail, okta_status, last_login, WOULD_DEACTIVATE)
+        return Outcome(SUCCESS, detail, *described, WOULD_DEACTIVATE)
 
     problem, stop = write_backup(session, user, backup)
     if problem:
-        return Outcome(ERROR, f"Not deactivated: backup failed ({problem})", okta_status, last_login, stop=stop)
+        return Outcome(ERROR, f"Not deactivated: backup failed ({problem})", *described, stop=stop)
 
     problem, stop = send_deactivation(session, user["id"])
     if problem:
-        return Outcome(ERROR, f"Deactivation failed: {problem}", okta_status, last_login, stop=stop)
-    return Outcome(SUCCESS, f"Deactivated (was {current_status})", okta_status, last_login, DEACTIVATED)
+        return Outcome(ERROR, f"Deactivation failed: {problem}", *described, stop=stop)
+    return Outcome(SUCCESS, f"Deactivated (was {current_status})", *described, DEACTIVATED)
 
 
 def process_all(
     session: requests.Session,
     rows: list[dict[str, str]],
-    output: Path,
+    args: argparse.Namespace,
     *,
     me: str,
-    backup_path: Path | None,
 ) -> tuple[dict[str, int], bool]:
     """Process every row and write the report (and, unless dry run, the backup) as we go.
 
-    backup_path None means a dry run: nothing is backed up or deactivated.
+    Uses args.output, args.match_by and args.backup; args.backup is None for a dry
+    run, when nothing is backed up or deactivated.
 
     Returns (counts, stopped): counts of success/error, and whether the run stopped early.
     """
     counts = {SUCCESS: 0, ERROR: 0}
-    seen_logins: set[str] = set()
+    seen: set[str] = set()
     stopped = False
 
     with (
-        output.open("w", newline="", encoding="utf-8") as fh,
-        open_backup(backup_path) if backup_path else contextlib.nullcontext() as backup,
+        args.output.open("w", newline="", encoding="utf-8") as fh,
+        open_backup(args.backup) if args.backup else contextlib.nullcontext() as backup,
     ):
         writer = csv.writer(fh)
-        writer.writerow(REPORT_COLUMNS)
+        writer.writerow(["name", args.match_by, *REPORT_COLUMNS])
 
         for row in rows:
             if stopped:
                 outcome = Outcome(ERROR, "Not processed (run stopped early)")
             else:
-                problem = validate_row(row, seen_logins)
+                problem = validate_row(row, seen, args.match_by)
                 if problem:
                     outcome = Outcome(ERROR, problem)
                 else:
-                    outcome = process_row(session, row, me=me, backup=backup)
+                    outcome = process_row(session, row, me=me, backup=backup, match_by=args.match_by)
                     stopped = outcome.stop
                     if stopped:
                         log.error("Stopping run: %s", outcome.detail)
@@ -582,7 +588,8 @@ def process_all(
                 safe_cells(
                     [
                         row["name"],
-                        row["login"],
+                        row["match"],
+                        outcome.okta_login,
                         outcome.okta_status,
                         outcome.last_login,
                         outcome.action,
@@ -593,55 +600,59 @@ def process_all(
             )
             fh.flush()  # Keep the report up to date in case the job is cancelled
             counts[outcome.status] += 1
-            log.info("%-7s %s: %s", outcome.status, row["login"] or "<blank>", outcome.detail)
+            log.info("%-7s %s: %s", outcome.status, row["match"] or "<blank>", outcome.detail)
 
     return counts, stopped
 
 
-def validate_user(session: requests.Session, login: str) -> tuple[str, str, bool]:
+def validate_user(session: requests.Session, value: str, match_by: str) -> tuple[str, str, str, bool]:
     """Look up one user for --validate, changing nothing.
 
-    Returns (okta_status, last_login, stop): stop is True if the whole run should stop.
+    Returns (okta_login, okta_status, last_login, stop): stop is True if the whole run should stop.
     """
-    user, problem, stop = look_up_user(session, login)
+    user, problem, stop = look_up_user(session, value, match_by)
+    if user is None and not problem:
+        return "", NOT_IN_OKTA, "", False
     if user is None:
-        if problem == USER_NOT_FOUND:
-            return NOT_IN_OKTA, "", False
-        return f"error: {problem}", "", stop
+        return "", f"error: {problem}", "", stop
     return (*describe_user(user), False)
 
 
-def validate_all(session: requests.Session, rows: list[dict[str, str]], output: Path) -> tuple[dict[str, int], bool]:
-    """Look up every row and write the validated copy of the CSV as we go.
+def validate_all(
+    session: requests.Session,
+    rows: list[dict[str, str]],
+    args: argparse.Namespace,
+) -> tuple[dict[str, int], bool]:
+    """Look up every row and write the validated copy of the CSV (args.output) as we go.
 
     Returns (counts, stopped): how many rows got each okta_status, and whether the run stopped early.
     """
     counts: dict[str, int] = {}
-    seen_logins: set[str] = set()
+    seen: set[str] = set()
     stopped = False
 
-    with output.open("w", newline="", encoding="utf-8") as fh:
+    with args.output.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
-        writer.writerow(VALIDATE_COLUMNS)
+        writer.writerow(["name", args.match_by, *VALIDATE_COLUMNS])
 
         for row in rows:
-            last_login = ""
+            okta_login = last_login = ""
             if stopped:
                 okta_status = "error: not checked (run stopped early)"
             else:
-                problem = validate_row(row, seen_logins)
+                problem = validate_row(row, seen, args.match_by)
                 if problem:
                     okta_status = f"error: {problem}"
                 else:
-                    okta_status, last_login, stopped = validate_user(session, row["login"])
+                    okta_login, okta_status, last_login, stopped = validate_user(session, row["match"], args.match_by)
                     if stopped:
                         log.error("Stopping run: %s", okta_status)
 
-            writer.writerow(safe_cells([row["name"], row["login"], okta_status, last_login]))
+            writer.writerow(safe_cells([row["name"], row["match"], okta_login, okta_status, last_login]))
             fh.flush()  # Keep the report up to date in case the job is cancelled
             key = ERROR if okta_status.startswith("error:") else okta_status
             counts[key] = counts.get(key, 0) + 1
-            log.info("%-12s %s %s", okta_status, row["login"] or "<blank>", last_login)
+            log.info("%-12s %s %s %s", okta_status, row["match"] or "<blank>", okta_login, last_login)
 
     return counts, stopped
 
@@ -665,6 +676,12 @@ def parse_args() -> argparse.Namespace:
         "--apply",
         action="store_true",
         help="actually deactivate users (without this, the run is a dry run and changes nothing)",
+    )
+    parser.add_argument(
+        "--match-by",
+        choices=MATCH_FIELDS,
+        default="email",
+        help="what the CSV's second column is: the Okta primary email (default) or the Okta login",
     )
     parser.add_argument(
         "--backup",
@@ -702,23 +719,24 @@ def check_config(input_path: Path, token: str) -> str | None:
     return None
 
 
-def write_unprocessed_report(rows: list[dict[str, str]], output: Path, reason: str, *, validate: bool) -> None:
-    """Write a report marking every row as not processed, so a failed run still has one to publish."""
-    with output.open("w", newline="", encoding="utf-8") as fh:
+def write_unprocessed_report(rows: list[dict[str, str]], args: argparse.Namespace, reason: str) -> None:
+    """Write a report (args.output) marking every row as not processed, so a failed run still has one to publish."""
+    with args.output.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
-        writer.writerow(VALIDATE_COLUMNS if validate else REPORT_COLUMNS)
+        writer.writerow(["name", args.match_by, *(VALIDATE_COLUMNS if args.validate else REPORT_COLUMNS)])
         for row in rows:
-            if validate:
-                cells = [row["name"], row["login"], f"error: not checked ({reason})", ""]
+            if args.validate:
+                cells = [row["name"], row["match"], "", f"error: not checked ({reason})", ""]
             else:
-                cells = [row["name"], row["login"], "", "", NO_ACTION, ERROR, f"Not processed ({reason})"]
+                cells = [row["name"], row["match"], "", "", "", NO_ACTION, ERROR, f"Not processed ({reason})"]
             writer.writerow(safe_cells(cells))
 
 
-def run_validate(session: requests.Session, rows: list[dict[str, str]], output: Path) -> int:
+def run_validate(session: requests.Session, rows: list[dict[str, str]], args: argparse.Namespace) -> int:
     """Run --validate and return main's exit code."""
     log.warning("VALIDATE: looking users up only; no changes will be made in Okta.")
-    counts, stopped = validate_all(session, rows, output)
+    output = args.output
+    counts, stopped = validate_all(session, rows, args)
     summary = ", ".join(f"{count} {status}" for status, count in sorted(counts.items()))
     log.info("Done (validate): %s. Report written to %s", summary, output)
     if stopped:
@@ -752,19 +770,19 @@ def main() -> int:
     session = make_session(token)
     me = who_am_i(session)
     if me is None:
-        write_unprocessed_report(rows, args.output, "preflight check failed; see the log", validate=args.validate)
+        write_unprocessed_report(rows, args, "preflight check failed; see the log")
         return 2
 
-    log.info("Authenticated as %s; %d rows to process", me, len(rows))
+    log.info("Authenticated as %s; %d rows to process, matching on Okta %s", me, len(rows), MATCH_FIELDS[args.match_by])
     if args.validate:
-        return run_validate(session, rows, args.output)
+        return run_validate(session, rows, args)
 
     if args.apply:
         log.warning("APPLY: users will be deactivated in %s, after backing each up to %s", OKTA_ORG_URL, args.backup)
     else:
         log.warning("DRY RUN: no changes will be made in Okta. Pass --apply to deactivate users.")
 
-    counts, stopped = process_all(session, rows, args.output, me=me, backup_path=args.backup)  # None unless --apply
+    counts, stopped = process_all(session, rows, args, me=me)
 
     log.info(
         "Done (%s): %d success, %d error. Report written to %s",
