@@ -27,6 +27,13 @@ parameters:
       - dry-run
       - validate
       - apply
+  - name: matchBy
+    displayName: "Match users by: email (Okta primary email) or login (Okta login). The second column of users.csv must hold this."
+    type: string
+    default: email
+    values:
+      - email
+      - login
 
 variables:
   # Library variable group (secret padlock on the token; pipeline permissions
@@ -49,6 +56,7 @@ stages:
               - template: templates/okta-deprovision-steps.yml
                 parameters:
                   mode: validate
+                  matchBy: ${{ parameters.matchBy }}
 
   # Every dry-run and apply run starts here; apply continues to the Apply stage
   - ${{ elseif or(eq(parameters.mode, 'dry-run'), eq(variables['Build.SourceBranch'], 'refs/heads/main')) }}:
@@ -61,6 +69,7 @@ stages:
               - template: templates/okta-deprovision-steps.yml
                 parameters:
                   mode: dry-run
+                  matchBy: ${{ parameters.matchBy }}
 
   - ${{ if eq(parameters.mode, 'apply') }}:
       - ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/main') }}:
@@ -78,6 +87,7 @@ stages:
                         - template: templates/okta-deprovision-steps.yml
                           parameters:
                             mode: apply
+                            matchBy: ${{ parameters.matchBy }}
 
       - ${{ else }}:
           - stage: Blocked

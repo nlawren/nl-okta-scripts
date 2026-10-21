@@ -8,6 +8,12 @@ parameters:
       - dry-run
       - validate
       - apply
+  - name: matchBy
+    type: string
+    default: email
+    values:
+      - email
+      - login
 
 steps:
   - bash: |
@@ -41,7 +47,7 @@ steps:
 
   # validate writes users-validated.csv; dry-run and apply write output.csv
   - bash: >-
-      uv run --no-sync deactivate_users.py --input users.csv
+      uv run --no-sync deactivate_users.py --input users.csv --match-by ${{ parameters.matchBy }}
       --output ${{ iif(eq(parameters.mode, 'validate'), 'users-validated.csv', 'output.csv') }}
       ${{ iif(eq(parameters.mode, 'apply'), '--apply --backup backup.jsonl', iif(eq(parameters.mode, 'validate'), '--validate', '')) }}
     displayName: ${{ iif(eq(parameters.mode, 'apply'), 'Deactivate Okta users', iif(eq(parameters.mode, 'validate'), 'Validate - Okta status report only', 'Dry run - report only')) }}
