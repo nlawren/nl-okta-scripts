@@ -1,0 +1,13 @@
+[project]
+name = "okta-scripts"
+version = "0.1.0"
+description = "Standalone read-only Okta export scripts"
+requires-python = ">=3.14"
+dependencies = ["requests>=2.34"]
+
+[dependency-groups]
+dev = ["ruff", "ty"]
+
+[tool.uv]
+required-version = ">=0.12"
+package = false

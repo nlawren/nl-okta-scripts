@@ -10,16 +10,3 @@ dev = ["ruff", "ty"]
 
 [tool.uv]
 required-version = ">=0.12"
-
-[tool.ruff]
-line-length = 120
-target-version = "py314"
-
-[tool.ruff.lint]
-select = ["ALL"]
-ignore = [
-    "COM812", # conflicts with the formatter
-    "CPY001", # no copyright header needed
-    "D203",   # conflicts with D211
-    "D213",   # conflicts with D212
-]
