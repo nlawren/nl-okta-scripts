@@ -1,0 +1,14 @@
+# Shared by okta-deprovision/ and scripts/
+line-length = 120
+target-version = "py314"
+
+[lint]
+select = ["ALL"]
+ignore = [
+    "COM812", # conflicts with the formatter
+    "CPY001", # no copyright header needed
+    "D203",   # conflicts with D211
+    "D213",   # conflicts with D212
+    "INP001", # standalone scripts, not packages
+]
+
